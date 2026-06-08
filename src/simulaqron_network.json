@@ -3,24 +3,17 @@
         "name": "default",
         "nodes": [
             {
-                "Alice": {
+                "Client": {
                     "app_socket": ["localhost", 8821],
                     "qnodeos_socket": ["localhost", 8822],
                     "vnode_socket": ["localhost", 8823]
                 }
             },
             {
-                "Bob": {
+                "Server": {
                     "app_socket": ["localhost", 8831],
                     "qnodeos_socket": ["localhost", 8832],
                     "vnode_socket": ["localhost", 8833]
-                }
-            },
-            {
-                "Referee": {
-                    "app_socket": ["localhost", 8851],
-                    "qnodeos_socket": ["localhost", 8852],
-                    "vnode_socket": ["localhost", 8853]
                 }
             }
         ],

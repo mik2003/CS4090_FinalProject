@@ -1,16 +1,17 @@
+"""Client"""
+
 import asyncio
 from asyncio import StreamReader, StreamWriter
 from pathlib import Path
 
 from simulaqron.general.host_config import SocketsConfig
-from simulaqron.sdk.protocol import SimulaQronClassicalServer
+from simulaqron.sdk.protocol import SimulaQronClassicalClient
 from simulaqron.settings import network_config
 from simulaqron.settings.network_config import NodeConfigType
 
 from helper import is_valid_username
 
 
-STATE_WAITING_LOGIN = "WAITING_LOGIN"
 STATE_WAITING_HI = "WAITING_HI"
 STATE_DONE = "DONE"
 
@@ -19,14 +20,14 @@ async def handle_login(writer: StreamWriter) -> str:
 
     while True:
         username = await asyncio.to_thread(
-            input, "Bob — enter your 3-bit input (e.g. 000): "
+            input, "Enter username: "
         )
         username = username.strip()
         if is_valid_username(username):
             break
         print("Invalid username. Please enter alphanumeric username (including '-' and '_') between 3 and 32 characters", flush=True)
 
-    writer.write(f"{username}\n".encode())
+    writer.write(f"LOGIN:{username}\n".encode())
 
     return STATE_WAITING_HI
 
@@ -35,12 +36,12 @@ async def handle_hi(_writer: StreamWriter) -> str:
     return STATE_DONE
 
 CLIENT_DISPATCH = {
-    (STATE_WAITING_LOGIN, "LOGIN"): handle_login,
     (STATE_WAITING_HI, "HI"): handle_hi,
 }
 
 async def run_client(reader: StreamReader, writer: StreamWriter) -> None:
-    state = STATE_WAITING_LOGIN
+    state = await handle_login(writer)
+    
     while state != STATE_DONE:
         data = await reader.readline()
         if not data:
@@ -63,9 +64,9 @@ async def run_client(reader: StreamReader, writer: StreamWriter) -> None:
 if __name__ == "__main__":
     _here = Path(__file__).parent
     network_config.read_from_file(_here / "simulaqron_network.json")
-    
+
     sockets_config = SocketsConfig(network_config, "default", NodeConfigType.APP)
-    server = SimulaQronClassicalServer(sockets_config, "Client")
-    server.register_client_handler(run_client)
-    print("Client: starting server...", flush=True)
-    server.start_serving()
+    client = SimulaQronClassicalClient(sockets_config)
+
+    print("Client: running...")
+    client.run_client("Server", run_client)
