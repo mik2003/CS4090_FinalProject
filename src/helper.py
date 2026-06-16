@@ -1,8 +1,3 @@
-import os
-import sys
-import psutil
-
-
 def parse_message(message: str) -> tuple[str, int, str]:
     """Parse a message of the form "COMMAND NODE ARGUMENT" into a tuple (COMMAND, NODE, ARGUMENT).
     If the message does not contain a space, the argument is returned as an empty string.
