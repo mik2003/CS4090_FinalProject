@@ -7,7 +7,7 @@ from netqasm.runtime.settings import set_simulator
 
 set_simulator("simulaqron")
 
-from netqasm.sdk import EPRSocket
+from netqasm.sdk import EPRSocket, Qubit
 
 from simulaqron.settings import network_config, simulaqron_settings
 from simulaqron.settings.network_config import NodeConfigType
@@ -19,20 +19,25 @@ from node import NetworkNode
 STATE_INIT = "INIT"
 STATE_READY = "READY"
 STATE_INIT_GHZ = "INIT_GHZ"
+STATE_EPR_MERGED = "EPR_MERGED"
 
 # Commands
 CMD_NEW_NODE = "NEW_NODE"
 CMD_START = "START"
-CMD_INIT_GHZ = "INIT_GHZ"
+CMD_RECV_EPR = "RECV_EPR"
+CMD_MERGE_EPR = "MERGE_EPR"
 
-# Shared mutable states across processes
+# Shared mutable states across the event loop
 state = STATE_INIT
+q: Qubit | None = None
+ancilla: Qubit | None = None
 
 # Node info
 node = NetworkNode(int(sys.argv[1]) if len(sys.argv) > 1 else 0)
 role = (
     sys.argv[2].strip().upper() if len(sys.argv) > 2 else "N"
 )  # Sender(S), Receiver(R), or Node(N)
+is_first_node = node.index == 0
 is_last_node = sys.argv[3].strip().upper() == "LAST" if len(sys.argv) > 3 else False
 
 # Check for valid role
@@ -93,40 +98,128 @@ async def handle_start(
 async def handle_ready_state(
     writer: StreamWriter, conn_node_index: int, argument: str
 ) -> str:
+    global q, ancilla
+
+    if node.quantum_connection is None:
+        raise ValueError("Quantum connection not initialized")
+
+    # Executes in the last node
+
     # When we receive a START command in the READY state, we can initiate the GHZ state creation
-    log("Every node is now ready. Starting GHZ state initialization.")
-    send_to_next_node(CMD_INIT_GHZ)
+    log("Every node is now ready. Starting EPR pairs creation...")
+
+    # Create an EPR pair using our qubit
+    q = prev_node_socket().create_keep()[0]
+    node.quantum_connection.flush()
+
+    send_to_prev_node(CMD_RECV_EPR)
 
     return STATE_INIT_GHZ
+
+
+async def handle_recv_epr(
+    writer: StreamWriter, conn_node_index: int, argument: str
+) -> str:
+    global q, ancilla
+
+    if node.quantum_connection is None:
+        raise ValueError("Quantum connection not initialized")
+
+    if is_first_node:
+        # Receive the EPR from the next node, now in the standard qubit
+        q = next_node_socket().recv_keep()[0]
+        node.quantum_connection.flush()
+
+        # Every node now has at least one EPR pair
+        # We now need to merge them
+        log("Created all EPRs pairs. Starting merge...")
+
+        # Do not apply any correction, we are initiating the chain
+        send_to_next_node(CMD_MERGE_EPR, "0")
+        return STATE_EPR_MERGED
+    else:
+        # Unless it's the first node, repeat the process
+        # Receive the EPR from the next node
+        ancilla = next_node_socket().recv_keep()[0]
+        log("Received EPR pair from next node")
+        q = prev_node_socket().create_keep()[0]
+        log("Sent EPR pair to previous node")
+        node.quantum_connection.flush()
+
+        send_to_prev_node(CMD_RECV_EPR)
+        return STATE_INIT_GHZ
+
+
+async def handle_epr_merge(
+    writer: StreamWriter, conn_node_index: int, argument: str
+) -> str:
+    global q, ancilla
+
+    if node.quantum_connection is None:
+        raise ValueError("Quantum connection not initialized")
+
+    if q is None:
+        raise ValueError("Qubit not initialized")
+
+    # Retrieve the correction from previous node merge
+    correction = int(argument)
+    if correction == 1:
+        q.X()
+
+    if is_last_node:
+        log("GHZ state completed.")
+        # TODO: do something with the GHZ state
+        return STATE_EPR_MERGED
+
+    if ancilla is None:
+        raise ValueError("Ancilla qubit not initialized")
+
+    # Apply the EPR (and GHZ) merge circuit, merging the previous
+    # GHZ state with the next EPR one
+    q.cnot(ancilla)
+
+    m = ancilla.measure()
+    node.quantum_connection.flush()
+    m = int(m)
+
+    # Send to the next node
+    send_to_next_node(CMD_MERGE_EPR, f"{m}")
+    return STATE_EPR_MERGED
 
 
 # ---- Communication ------------------------------------------------
 
 
+def prev_node():
+    if is_first_node:
+        return node.connections[len(node.connections) - 1]
+    else:
+        return node.connections[node.index - 1]
+
+
+def next_node():
+    if is_last_node:
+        return node.connections[0]
+    else:
+        return node.connections[node.index + 1]
+
+
 def send_to_prev_node(command: str, argument: str = "") -> None:
     log(f"Sending '{command} {argument}' to previous node...")
-    if node.index == 0:
-        # If this is the first node, send to the last node to complete the ring
-        node.connections[len(node.connections) - 1].send_classical(command, argument)
-    else:
-        node.connections[node.index - 1].send_classical(command, argument)
+    prev_node().send_classical(command, argument)
 
 
 def send_to_next_node(command: str, argument: str = "") -> None:
     log(f"Sending '{command} {argument}' to next node...")
-    if is_last_node:
-        # If this is the last node, send to Node0 to complete the ring
-        node.connections[0].send_classical(command, argument)
-    else:
-        node.connections[node.index + 1].send_classical(command, argument)
+    next_node().send_classical(command, argument)
 
 
 def prev_node_socket() -> EPRSocket:
-    return node.connections[node.index - 1].epr_socket
+    return prev_node().epr_socket
 
 
 def next_node_socket() -> EPRSocket:
-    return node.connections[node.index + 1].epr_socket
+    return next_node().epr_socket
 
 
 # ---- Handlers map -------------------------------------------------
@@ -136,6 +229,8 @@ EVENT_HANDLERS = {
     (STATE_INIT, CMD_NEW_NODE): handle_new_node,
     (STATE_INIT, CMD_START): handle_start,
     (STATE_READY, CMD_START): handle_ready_state,
+    (STATE_READY, CMD_RECV_EPR): handle_recv_epr,
+    (STATE_INIT_GHZ, CMD_MERGE_EPR): handle_epr_merge,
 }
 
 
@@ -191,6 +286,7 @@ if __name__ == "__main__":
     if is_last_node:
         log(f"Connecting to next node (Node0) to complete the ring...")
         node.connect_to_node(0, event_loop)
+        node.complete_network()
 
         # Wait for a moment to ensure the node is connected
         asyncio.run(asyncio.sleep(1))
@@ -199,7 +295,6 @@ if __name__ == "__main__":
         send_to_next_node(CMD_START)
 
         state = STATE_READY
-        node.complete_network()
         log(f"Completed network setup. This is the last node.")
 
     # Wait for all threads to finish (this will block the main thread)

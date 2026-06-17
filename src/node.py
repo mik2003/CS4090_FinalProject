@@ -1,6 +1,5 @@
 import asyncio
 import threading
-from types import CoroutineType
 
 from simulaqron.general.host_config import SocketsConfig
 from simulaqron.sdk.protocol import (
@@ -96,7 +95,7 @@ class NetworkNode:
 
     def complete_network(self) -> None:
         # Create the quantum interface using all EPR sockets
-        self.quantum_interface = NetQASMConnection(
+        self.quantum_connection = NetQASMConnection(
             f"Node{self.index}",
             epr_sockets=[conn.epr_socket for conn in self.connections.values()],
         )
