@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import time
 
 from simulaqron.general.host_config import SocketsConfig
 from simulaqron.sdk.protocol import (
@@ -32,7 +33,6 @@ class NodeConnection:
         sockets_config: SocketsConfig,
         event_loop: Callable[[StreamReader, StreamWriter], Awaitable[None]],
     ) -> None:
-        client = SimulaQronClassicalClient(sockets_config)
 
         async def _write_loop(reader: StreamReader, writer: StreamWriter) -> None:
             while True:
@@ -52,11 +52,22 @@ class NodeConnection:
 
             await asyncio.gather(write_task, event_loop_task)
 
+        def _run_with_retry() -> None:
+            # Retry connection if connection is refused
+            max_retries = 20
+            retry_delay = 0.5
+            for attempt in range(max_retries):
+                try:
+                    client = SimulaQronClassicalClient(sockets_config)
+                    client.run_client(f"Node{self.target_index}", _client_loop)
+                    return
+                except ConnectionRefusedError:
+                    if attempt == max_retries - 1:
+                        raise
+                    time.sleep(retry_delay)
+
         # Spawn the client connection in a separate thread to avoid blocking the main thread
-        self.thread = threading.Thread(
-            target=client.run_client,
-            args=(f"Node{self.target_index}", _client_loop),
-        )
+        self.thread = threading.Thread(target=_run_with_retry)
         self.thread.start()
 
     def send_classical(self, command: str, data: str) -> None:

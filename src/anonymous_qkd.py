@@ -405,6 +405,11 @@ async def event_loop(reader: StreamReader, writer: StreamWriter) -> None:
 
     while True:
         data = await reader.readline()
+
+        if not data:  # EOF: peer closed the connection
+            log("Connection closed by peer")
+            return
+
         msg = data.decode()
 
         log(f"Received message: '{msg.strip()}'")
