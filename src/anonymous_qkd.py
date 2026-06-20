@@ -1,5 +1,6 @@
 import sys
 import asyncio
+import numpy as np
 from asyncio import StreamReader, StreamWriter
 from pathlib import Path
 
@@ -20,17 +21,53 @@ STATE_INIT = "INIT"
 STATE_READY = "READY"
 STATE_INIT_GHZ = "INIT_GHZ"
 STATE_EPR_MERGED = "EPR_MERGED"
+STATE_ANON_TRANSMIT = "ANON_TRANSMIT"
+STATE_ANON_ENTANGLEMENT = "ANON_ENTANGLEMENT"
+STATE_TRANSMIT_DONE = "TRANSMIT_DONE"
+STATE_ENTANGLEMENT_DONE = "ENTANGLEMENT_DONE"
 
 # Commands
 CMD_NEW_NODE = "NEW_NODE"
 CMD_START = "START"
 CMD_RECV_EPR = "RECV_EPR"
 CMD_MERGE_EPR = "MERGE_EPR"
+CMD_ANON_TRANSMIT = "ANON_TRANSMIT"
+CMD_ANON_ENTANGLEMENT = "ANON_ENTANGLEMENT"
+CMD_TRANSMIT_RESULT = "TRANSMIT_RESULT"
+CMD_ENTANGLEMENT_COMPLETED = "ENTANGLEMENT_COMPLETED"
+
+# To perform anonymous QKD, we start by teleporting random BB84 states
+# from the send to the receiver. Each teleportation uses:
+# - One round of anonymous entanglement
+# - Two rounds of classical communication for the corrections
+# This procedure is repeated several times. Each time, the receiver measures
+# the teleported state in a random basis.
+# When enough states have been teleported, the sender shares the bases
+# used for each state, and the receiver can discard the states teleported
+# in the wrong basis. This takes several rounds of anonymous communication.
+
+# Procedures and phases are higher order states that determine what the network
+# should do next.
+
+# Procedures
+PROC_ANON_TRANSMIT = "ANON_TRANSMIT"
+PROC_ANON_ENTANGLEMENT = "ANON_ENTANGLEMENT"
+
+# Phases
+PHASE_BB84_DISTRIBUTION = "BB84_DISTRIBUTION"
+PHASE_BASIS_RECONCILIATION = "BASIS_RECONCILIATION"
+
 
 # Shared mutable states across the event loop
 state = STATE_INIT
+procedure = PROC_ANON_TRANSMIT
+phase = PHASE_BB84_DISTRIBUTION
+
 q: Qubit | None = None
 ancilla: Qubit | None = None
+rng = np.random.default_rng()
+
+bit_to_send: int | None = 1
 
 # Node info
 node = NetworkNode(int(sys.argv[1]) if len(sys.argv) > 1 else 0)
@@ -76,48 +113,32 @@ async def handle_new_node(
     elif node.index == 0:  # Connecting first to last node
         log(f"Connected to previous node (Node{conn_node_index})")
     else:
-        log(f"Connected to unexpected node index {conn_node_index} - ignoring")
+        log(f"Connected to unexpected node index {conn_node_index}")
 
     node.connect_to_node(conn_node_index, event_loop)
 
     return STATE_INIT
 
 
-async def handle_start(
+async def handle_start_broadcast(
     writer: StreamWriter, conn_node_index: int, argument: str
 ) -> str:
     # Broadcast START across the network to ensure all nodes are ready
-    log("Received START command. Transitioning to READY state.")
-    send_to_next_node(CMD_START)
-    node.complete_network()
-    log("Completed network setup.")
+
+    if is_last_node:
+        # When we receive a START command in the READY state, we can initiate the GHZ state creation
+        log("Every node is now ready. Starting EPR pairs creation...")
+        send_to_next_node(CMD_RECV_EPR)
+    else:
+        log("Received START command. Completing network.")
+        send_to_next_node(CMD_START)
+        node.complete_network()
+        log("Completed network setup.")
 
     return STATE_READY
 
 
-async def handle_ready_state(
-    writer: StreamWriter, conn_node_index: int, argument: str
-) -> str:
-    global q, ancilla
-
-    if node.quantum_connection is None:
-        raise ValueError("Quantum connection not initialized")
-
-    # Executes in the last node
-
-    # When we receive a START command in the READY state, we can initiate the GHZ state creation
-    log("Every node is now ready. Starting EPR pairs creation...")
-
-    # Create an EPR pair using our qubit
-    q = prev_node_socket().create_keep()[0]
-    node.quantum_connection.flush()
-
-    send_to_prev_node(CMD_RECV_EPR)
-
-    return STATE_INIT_GHZ
-
-
-async def handle_recv_epr(
+async def handle_recv_epr_broadcast(
     writer: StreamWriter, conn_node_index: int, argument: str
 ) -> str:
     global q, ancilla
@@ -126,31 +147,39 @@ async def handle_recv_epr(
         raise ValueError("Quantum connection not initialized")
 
     if is_first_node:
-        # Receive the EPR from the next node, now in the standard qubit
-        q = next_node_socket().recv_keep()[0]
+        # Start the chain
+        log("Starting EPRs creation...")
+        q = next_node_socket().create_keep()[0]
+        node.quantum_connection.flush()
+
+        # Do not apply any correction, we are initiating the chain
+        send_to_next_node(CMD_RECV_EPR)
+    elif is_last_node:
+        # Receive the EPR from the previous node, now in the standard qubit
+        q = prev_node_socket().recv_keep()[0]
         node.quantum_connection.flush()
 
         # Every node now has at least one EPR pair
         # We now need to merge them
         log("Created all EPRs pairs. Starting merge...")
 
-        # Do not apply any correction, we are initiating the chain
-        send_to_next_node(CMD_MERGE_EPR, "0")
-        return STATE_EPR_MERGED
+        # Start the merge process
+        send_to_next_node(CMD_MERGE_EPR)
     else:
-        # Unless it's the first node, repeat the process
-        # Receive the EPR from the next node
-        ancilla = next_node_socket().recv_keep()[0]
-        log("Received EPR pair from next node")
-        q = prev_node_socket().create_keep()[0]
-        log("Sent EPR pair to previous node")
+        # Unless it's the first or last node, repeat the process
+        # Receive the EPR from the prev node
+        ancilla = prev_node_socket().recv_keep()[0]
+        log("Received EPR pair from previous node")
+        q = next_node_socket().create_keep()[0]
+        log("Sent EPR pair to next node")
         node.quantum_connection.flush()
 
-        send_to_prev_node(CMD_RECV_EPR)
-        return STATE_INIT_GHZ
+        send_to_next_node(CMD_RECV_EPR)
+
+    return STATE_INIT_GHZ
 
 
-async def handle_epr_merge(
+async def handle_epr_merge_broadcast(
     writer: StreamWriter, conn_node_index: int, argument: str
 ) -> str:
     global q, ancilla
@@ -161,14 +190,23 @@ async def handle_epr_merge(
     if q is None:
         raise ValueError("Qubit not initialized")
 
+    if is_first_node:
+        # Do nothing if it's the first node
+        send_to_next_node(CMD_MERGE_EPR)
+        return STATE_EPR_MERGED
+
     # Retrieve the correction from previous node merge
-    correction = int(argument)
+    correction = int(argument) if argument != "" else 0
     if correction == 1:
         q.X()
 
     if is_last_node:
         log("GHZ state completed.")
-        # TODO: do something with the GHZ state
+        # Start current procedure
+        if procedure == PROC_ANON_ENTANGLEMENT:
+            send_to_next_node(CMD_ANON_ENTANGLEMENT)
+        else:
+            send_to_next_node(CMD_ANON_TRANSMIT)
         return STATE_EPR_MERGED
 
     if ancilla is None:
@@ -185,6 +223,111 @@ async def handle_epr_merge(
     # Send to the next node
     send_to_next_node(CMD_MERGE_EPR, f"{m}")
     return STATE_EPR_MERGED
+
+
+async def handle_anon_transmit_broadcast(
+    writer: StreamWriter, conn_node_index: int, argument: str
+) -> str:
+    global q
+
+    if q is None:
+        raise ValueError("Qubit not initialized")
+    if node.quantum_connection is None:
+        raise ValueError("Quantum connection not initialized")
+
+    parity = int(argument) if argument != "" else 0
+
+    log(f"Performing anonymous transmission. Parity is {parity}")
+
+    # Sender applies Z to their qubit
+    if role == "S":
+        if bit_to_send:
+            q.Z()
+    # Every player applies H
+    q.H()
+    # Measure and update parity
+    m = q.measure()
+    node.quantum_connection.flush()
+    m = int(m)
+
+    parity = parity ^ m
+
+    if is_last_node:
+        # Broadcast the result across the network
+        send_to_next_node(CMD_TRANSMIT_RESULT, f"{parity}")
+    else:
+        send_to_next_node(CMD_ANON_TRANSMIT, f"{parity}")
+
+    return STATE_TRANSMIT_DONE
+
+
+async def handle_anon_entanglement_broadcast(
+    writer: StreamWriter, conn_node_index: int, argument: str
+) -> str:
+    global q
+
+    if q is None:
+        raise ValueError("Qubit not initialized")
+    if node.quantum_connection is None:
+        raise ValueError("Quantum connection not initialized")
+
+    parity = int(argument) if argument != "" else 0
+
+    log(f"Performing anonymous entanglement. Parity is {parity}")
+
+    # Every standard node applies H, measures and broadcasts parity
+    if role == "N":
+        q.H()
+        m = q.measure()
+        node.quantum_connection.flush()
+        m = int(m)
+        parity = parity ^ m
+    # The sender picks a random bit, and applies Z^b, measures and broadcasts
+    elif role == "S":
+        b = rng.integers(0, 2)
+        if b:
+            q.Z()
+        parity = parity ^ b
+    # The receiver applies X^parity
+    elif role == "R":
+        if parity:
+            q.X()
+
+    if is_last_node:
+        send_to_next_node(CMD_ENTANGLEMENT_COMPLETED)
+    else:
+        send_to_next_node(CMD_ANON_ENTANGLEMENT, f"{parity}")
+
+    return STATE_ENTANGLEMENT_DONE
+
+
+async def handle_transmit_result(
+    writer: StreamWriter, conn_node_index: int, argument: str
+):
+    result = int(argument)
+    log(f"Transmission result is {result}")
+    send_to_next_node(CMD_TRANSMIT_RESULT, f"{result}")
+
+    if is_last_node:
+        # TODO: determine whether to create another GHZ
+        # Update procedure and phase
+        pass
+
+    return STATE_READY
+
+
+async def handle_entanglement_completed(
+    writer: StreamWriter, conn_node_index: int, argument: str
+):
+    log("Entanglement completed")
+    send_to_next_node(CMD_ENTANGLEMENT_COMPLETED)
+
+    if is_last_node:
+        # TODO: determine whether to create another GHZ
+        # Update procedure and phase
+        pass
+
+    return STATE_READY
 
 
 # ---- Communication ------------------------------------------------
@@ -226,11 +369,17 @@ def next_node_socket() -> EPRSocket:
 
 
 EVENT_HANDLERS = {
-    (STATE_INIT, CMD_NEW_NODE): handle_new_node,
-    (STATE_INIT, CMD_START): handle_start,
-    (STATE_READY, CMD_START): handle_ready_state,
-    (STATE_READY, CMD_RECV_EPR): handle_recv_epr,
-    (STATE_INIT_GHZ, CMD_MERGE_EPR): handle_epr_merge,
+    (STATE_INIT, CMD_NEW_NODE): handle_new_node,  # Connect to new node
+    (STATE_INIT, CMD_START): handle_start_broadcast,  # Complete networks for all nodes
+    (STATE_READY, CMD_RECV_EPR): handle_recv_epr_broadcast,  # Distribute EPRs
+    (STATE_INIT_GHZ, CMD_MERGE_EPR): handle_epr_merge_broadcast,  # Merge EPRs
+    (STATE_EPR_MERGED, CMD_ANON_TRANSMIT): handle_anon_transmit_broadcast,
+    (STATE_EPR_MERGED, CMD_ANON_ENTANGLEMENT): handle_anon_entanglement_broadcast,
+    (STATE_TRANSMIT_DONE, CMD_TRANSMIT_RESULT): handle_transmit_result,
+    (
+        STATE_ENTANGLEMENT_DONE,
+        CMD_ENTANGLEMENT_COMPLETED,
+    ): handle_entanglement_completed,
 }
 
 
@@ -265,6 +414,8 @@ async def event_loop(reader: StreamReader, writer: StreamWriter) -> None:
             argument,
         )
 
+        log(f"Transitioning to state {state}")
+
 
 # ---- Main ---------------------------------------------------------
 
@@ -294,7 +445,6 @@ if __name__ == "__main__":
         send_to_next_node(CMD_NEW_NODE)
         send_to_next_node(CMD_START)
 
-        state = STATE_READY
         log(f"Completed network setup. This is the last node.")
 
     # Wait for all threads to finish (this will block the main thread)
