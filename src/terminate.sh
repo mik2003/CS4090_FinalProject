@@ -1,10 +1,12 @@
 #!/usr/bin/env sh
-TEST_PIDS=$(ps aux | grep python | grep -E "alice|bob" | awk '{print $2}')
-if [ "$TEST_PIDS" != "" ]; then
-    kill -9 $TEST_PIDS
-fi
-if [ -f ~/.simulaqron_pids/simulaqron_network_default.pid ]; then
+# Kill any running anonymous-QKD node processes
+pkill -9 -f anonymous_qkd.py 2>/dev/null
+
+# Stop SimulaQron and clear its pid file (a stale file blocks start.sh)
+PIDFILE="$HOME/.simulaqron_pids/simulaqron_network_default.pid"
+if [ -f "$PIDFILE" ]; then
     if ! simulaqron stop; then
-        cat $HOME/.simulaqron_pids/simulaqron_network_default.pid | xargs kill -9
+        xargs kill -9 < "$PIDFILE" 2>/dev/null
     fi
+    rm -f "$PIDFILE"
 fi
