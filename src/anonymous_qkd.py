@@ -65,6 +65,7 @@ phase = PHASE_BB84_DISTRIBUTION
 
 q: Qubit | None = None
 ancilla: Qubit | None = None
+memory: Qubit | None = None  # Temporarily store the qubit waiting for corrections
 rng = np.random.default_rng()
 
 bit_to_send: int | None = 1
@@ -308,9 +309,16 @@ async def handle_transmit_result(
     log(f"Transmission result is {result}")
     send_to_next_node(CMD_TRANSMIT_RESULT, f"{result}")
 
+    # TODO:
+    # If receiver do something with the transmitted data
+    # This includes:
+    # - Apply corrections to the state for teleportation
+    # - Save BB84 bases
+    # - Privacy Amplification
+
     if is_last_node:
-        # TODO: determine whether to create another GHZ
-        # Update procedure and phase
+        # TODO: Update procedure and phase
+        # Stop the program if done
         pass
 
     return STATE_READY
@@ -322,9 +330,15 @@ async def handle_entanglement_completed(
     log("Entanglement completed")
     send_to_next_node(CMD_ENTANGLEMENT_COMPLETED)
 
+    # TODO:
+    # If sender perform teleportation circuit and prepare
+    # corrections to send in the next phase
+
+    # If receiver save the qubit into `memory` waiting for corrections
+
     if is_last_node:
-        # TODO: determine whether to create another GHZ
-        # Update procedure and phase
+        # TODO: Update procedure and phase
+        # Stop the program if done
         pass
 
     return STATE_READY
