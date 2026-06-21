@@ -65,7 +65,7 @@ SUB_TX_Z = "TX_Z"  # broadcast Z-correction bit a, then R measures
 
 
 # ---- Pipeline parameters --------------------------------------
-NUM_SYMBOLS = 4  # BB84 states to teleport; sifted key ~ NUM_SYMBOLS/2
+NUM_SYMBOLS = 32  # BB84 states to teleport; sifted key ~ NUM_SYMBOLS/2
 
 # ---- Shared mutable states across the event loop -------------------
 
@@ -252,10 +252,15 @@ async def handle_epr_merge_broadcast(
         send_to_next_node(CMD_MERGE_EPR)
         return STATE_EPR_MERGED
 
-    # Retrieve the correction from previous node merge
+    # Apply correction from the previous merge.
+    # For intermediate nodes, the correction belongs to the qubit received
+    # from the previous node, i.e. ancilla. For the last node, that qubit is q.
     correction = int(argument) if argument != "" else 0
     if correction == 1:
-        q.Z()
+        if is_last_node:
+            q.X()
+        else:
+            ancilla.X()
 
     if is_last_node:
         log("GHZ state completed.")
@@ -266,19 +271,21 @@ async def handle_epr_merge_broadcast(
             send_to_next_node(CMD_ANON_TRANSMIT)
         return STATE_EPR_MERGED
 
-    if ancilla is None:
-        raise ValueError("Ancilla qubit not initialized")
+    # Merge previous GHZ half with the new EPR half.
+    # Existing GHZ/previous qubit = ancilla
+    # New local EPR half = q
+    ancilla.cnot(q)
 
-    # Apply the EPR (and GHZ) merge circuit, merging the previous
-    # GHZ state with the next EPR one
-    q.cnot(ancilla)
-
-    m = ancilla.measure()
+    m = q.measure()
     node.quantum_connection.flush()
     m = int(m)
 
-    # Send to the next node
+    # Keep the previous/GHZ qubit as this node's protocol qubit.
+    q = ancilla
+    ancilla = None
+
     send_to_next_node(CMD_MERGE_EPR, f"{m}")
+
     return STATE_EPR_MERGED
 
 
@@ -300,6 +307,8 @@ async def handle_anon_transmit_broadcast(
 
     # Only the designated transmitter encodes (sender for most phases,
     # receiver while it announces its bases).
+    if role == current_transmitter():
+        log(f"anon tx intended bit = {next_outgoing_bit()}")
     if role == current_transmitter() and next_outgoing_bit():
         q.Z()
 
