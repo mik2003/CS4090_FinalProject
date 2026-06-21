@@ -65,7 +65,7 @@ SUB_TX_Z = "TX_Z"  # broadcast Z-correction bit a, then R measures
 
 
 # ---- Pipeline parameters --------------------------------------
-NUM_SYMBOLS = 16  # BB84 states to teleport; sifted key ~ NUM_SYMBOLS/2
+NUM_SYMBOLS = 4  # BB84 states to teleport; sifted key ~ NUM_SYMBOLS/2
 
 # ---- Shared mutable states across the event loop -------------------
 
@@ -255,7 +255,7 @@ async def handle_epr_merge_broadcast(
     # Retrieve the correction from previous node merge
     correction = int(argument) if argument != "" else 0
     if correction == 1:
-        q.X()
+        q.Z()
 
     if is_last_node:
         log("GHZ state completed.")
@@ -510,13 +510,19 @@ def _sift_only() -> None:
     global raw_key, final_key
 
     if role == "S":
+        log(f"sender_bases      = {sender_bases}")
+        log(f"recv_bases_seen   = {recv_bases_seen}")
         kept = _kept_indices(sender_bases, recv_bases_seen)
         key = np.array([sender_bits[i] for i in kept], dtype=np.uint8)
     elif role == "R":
+        log(f"sender_bases_seen = {sender_bases_seen}")
+        log(f"recv_bases        = {recv_bases}")
         kept = _kept_indices(sender_bases_seen, recv_bases)
         key = np.array([recv_outcomes[i] for i in kept], dtype=np.uint8)
     else:
         return
+
+    log(f"kept = {kept}")
 
     raw_key = final_key = key
     log(f"sifted {len(kept)}/{NUM_SYMBOLS} -> key of {len(key)} bits")
