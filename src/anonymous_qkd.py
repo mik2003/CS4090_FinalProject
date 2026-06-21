@@ -151,10 +151,29 @@ if role not in ["S", "R", "N"]:
 
 
 def log(message: str) -> None:
-    print(
-        f"Node({node.index}) [{role}] [{state}]: {message}",
-        flush=True,
-    )
+    # Build a context label, including only the parts that are meaningful now.
+    ctx = [f"Node({node.index})", f"[{role}]", f"[{state}]"]
+
+    # Schedule info is only meaningful once we're past network setup.
+    if (
+        state not in (STATE_INIT, STATE_READY)
+        or phase != PHASE_BB84_DISTRIBUTION
+        or symbol_index > 0
+    ):
+        if phase == PHASE_BB84_DISTRIBUTION:
+            ctx.append(f"[{phase} sym={symbol_index}/{NUM_SYMBOLS} {substep}]")
+        elif phase in (PHASE_RECON_SENDER_BASES, PHASE_RECON_RECEIVER_BASES):
+            ctx.append(f"[{phase} {recon_index}/{NUM_SYMBOLS}]")
+        elif phase == PHASE_HEADER:
+            ctx.append(f"[{phase} {header_index}/{HEADER_BITS}]")
+        elif phase == PHASE_EC_SYNDROME:
+            ctx.append(f"[{phase} {ec_index}/{ec_len_global}]")
+        elif phase == PHASE_PA:
+            ctx.append(f"[{phase} {pa_index}/{pa_len_global}]")
+        else:  # PHASE_DONE
+            ctx.append(f"[{phase}]")
+
+    print(" ".join(ctx) + f": {message}", flush=True)
 
 
 # ---- Connections Manager ------------------------------------------
