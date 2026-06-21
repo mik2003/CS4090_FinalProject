@@ -20,8 +20,6 @@ STATE_INIT = "INIT"
 STATE_READY = "READY"
 STATE_INIT_GHZ = "INIT_GHZ"
 STATE_EPR_MERGED = "EPR_MERGED"
-STATE_ANON_TRANSMIT = "ANON_TRANSMIT"
-STATE_ANON_ENTANGLEMENT = "ANON_ENTANGLEMENT"
 STATE_TRANSMIT_DONE = "TRANSMIT_DONE"
 STATE_ENTANGLEMENT_DONE = "ENTANGLEMENT_DONE"
 
@@ -54,16 +52,6 @@ PROC_ANON_TRANSMIT = "ANON_TRANSMIT"
 PROC_ANON_ENTANGLEMENT = "ANON_ENTANGLEMENT"
 
 
-# ---- Pipeline parameters --------------------------------------
-
-NUM_SYMBOLS = 16  # BB84 states to teleport; sifted key ~ NUM_SYMBOLS/2
-D_V, D_C = 3, 10  # LDPC degrees; need sifted >= D_C
-LDPC_SEED = 42  # must match across nodes
-P_E = 0.4  # Eve's assumed BSC flip prob (entropy bound)
-EPSILON = 1e-3  # privacy-amplification security parameter
-KEYLEN_BITS = 16  # width for serializing integers over the bit channel
-HEADER_BITS = 2 * KEYLEN_BITS  # ec_len + pa_len
-
 # Phases
 PHASE_BB84_DISTRIBUTION = "BB84_DISTRIBUTION"
 PHASE_RECON_SENDER_BASES = "RECON_SENDER_BASES"  # sender announces theta_i
@@ -75,6 +63,9 @@ SUB_ENT = "ENT"  # anonymous entanglement + teleport
 SUB_TX_X = "TX_X"  # broadcast X-correction bit b
 SUB_TX_Z = "TX_Z"  # broadcast Z-correction bit a, then R measures
 
+
+# ---- Pipeline parameters --------------------------------------
+NUM_SYMBOLS = 16  # BB84 states to teleport; sifted key ~ NUM_SYMBOLS/2
 
 # ---- Shared mutable states across the event loop -------------------
 
@@ -93,31 +84,19 @@ rng = np.random.default_rng()
 symbol_index = 0
 substep = SUB_ENT
 recon_index = 0
-ec_index = 0
-pa_index = 0
-round_index = 0  # only the last node uses this as a safety counter
-
-ec_len_global = 0  # learned by ALL nodes from the HEADER broadcast
-pa_len_global = 0
 
 # -- Sender ("S") private data --
 sender_bits: list[int] = []
 sender_bases: list[int] = []
 pending_corr: tuple[int, int] | None = None  # (b = X-corr, a = Z-corr)
 recv_bases_seen: list[int] = []  # phi_i learned during receiver-basis recon
-ec_payload: list[int] = []  # syndrome bits to broadcast
-pa_payload: list[int] = []  # KEYLEN_BITS(key_len) + seed bits
-header_payload: list[int] = []  # KEYLEN_BITS(ec_len) + KEYLEN_BITS(pa_len)
 
 # -- Receiver ("R") private data --
 recv_bases: list[int] = []
 recv_outcomes: list[int] = []
 sender_bases_seen: list[int] = []  # theta_i learned during sender-basis recon
-ec_collected: list[int] = []
-pa_collected: list[int] = []
 
 # -- Shared / outputs --
-header_collected: list[int] = []  # every node records the public header bits
 raw_key = None  # x_A on sender, x_B on receiver
 final_key = None
 _shutting_down = False
@@ -156,30 +135,7 @@ def log(message: str) -> None:
     print(" ".join(ctx) + f": {message}", flush=True)
 
 
-# ---- Connections Manager ------------------------------------------
-
-
-def determine_node_type(conn_node_index: int) -> str:
-    if conn_node_index == node.index - 1:
-        return "PREV"
-    elif conn_node_index == node.index + 1:
-        return "NEXT"
-    else:
-        return "OTHER"
-
-
 # ---- Schedule helpers ---------------------------------------------
-
-
-def int_to_bits(value: int, width: int) -> list[int]:
-    return [(value >> (width - 1 - i)) & 1 for i in range(width)]
-
-
-def bits_to_int(bits: list[int]) -> int:
-    v = 0
-    for b in bits:
-        v = (v << 1) | int(b)
-    return v
 
 
 def current_round_is_entanglement() -> bool:
@@ -190,7 +146,7 @@ def current_transmitter() -> str:
     """Which role ENCODES during the current anonymous-transmission round."""
     if phase == PHASE_RECON_RECEIVER_BASES:
         return "R"
-    return "S"  # corrections, sender bases, header, syndrome, PA
+    return "S"  # corrections, sender bases
 
 
 def next_outgoing_bit() -> int:
@@ -405,7 +361,7 @@ async def handle_anon_entanglement_broadcast(
     #         q.X()
 
     if is_last_node:
-        send_to_next_node(CMD_ENTANGLEMENT_COMPLETED)
+        send_to_next_node(CMD_ENTANGLEMENT_COMPLETED, f"{parity}")
     else:
         send_to_next_node(CMD_ANON_ENTANGLEMENT, f"{parity}")
 
@@ -416,13 +372,6 @@ async def handle_transmit_result(writer: StreamWriter, conn_node_index: int, arg
     global memory
 
     result = int(argument)
-
-    # TODO:
-    # If receiver do something with the transmitted data
-    # This includes:
-    # - Apply corrections to the state for teleportation
-    # - Save BB84 bases
-    # - Privacy Amplification
 
     # role action for the CURRENT round
     if phase == PHASE_BB84_DISTRIBUTION and role == "R":
@@ -494,7 +443,7 @@ async def handle_entanglement_completed(writer: StreamWriter, conn_node_index: i
         sender_bits.append(v)
         sender_bases.append(theta)
         pending_corr = (b, a)
-        log(f"Teleported BB84 (v={v}, basis={theta}); corr X:{b} X:{a}")
+        log(f"Teleported BB84 (v={v}, basis={theta}); corr X:{b} Z:{a}")
 
     if is_last_node:
         advance_schedule()
@@ -510,8 +459,7 @@ async def handle_entanglement_completed(writer: StreamWriter, conn_node_index: i
 
 
 def advance_schedule() -> None:
-    global phase, symbol_index, substep, recon_index, header_index
-    global ec_index, pa_index, ec_len_global, pa_len_global
+    global phase, symbol_index, substep, recon_index
 
     if phase == PHASE_BB84_DISTRIBUTION:
         if substep == SUB_ENT:
@@ -553,20 +501,11 @@ def conductor_next() -> None:
     send_to_next_node(CMD_RECV_EPR)  # rebuild a fresh GHZ for the next round
 
 
-# ---- Classical back-half (sift + LDPC reconciliation + Toeplitz PA) ----
+# ---- Classical back-half (sift) --------------------------
 
 
 def _kept_indices(bases_a: list[int], bases_b: list[int]) -> list[int]:
     return [i for i in range(NUM_SYMBOLS) if bases_a[i] == bases_b[i]]
-
-
-def _truncate_to_block(bits: list[int]) -> np.ndarray:
-    n = (len(bits) // D_C) * D_C  # LDPC needs length divisible by D_C
-    return np.array(bits[:n], dtype=np.uint8)
-
-
-def n_syndrome_len(n: int) -> int:
-    return D_V * (n // D_C)
 
 
 def _sift_only() -> None:
@@ -695,7 +634,7 @@ async def event_loop(reader: StreamReader, writer: StreamWriter) -> None:
 
         if handler is None:
             log(f"no transition for '{matching}' - ignoring")
-            return
+            continue
 
         state = await handler(
             writer,
