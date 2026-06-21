@@ -285,7 +285,7 @@ async def handle_epr_merge_broadcast(
 async def handle_anon_transmit_broadcast(
     writer: StreamWriter, conn_node_index: int, argument: str
 ) -> str:
-    """GHZ-based anonymous broadcast of ONE bit from current_tranmitter()"""
+    """GHZ-based anonymous broadcast of ONE bit from current_transmitter()"""
 
     global q
 
@@ -355,10 +355,6 @@ async def handle_anon_entanglement_broadcast(
             q.Z()
         parity = parity ^ b
     # role == "R": keep q untouched; correction happens on the completion lap.
-    # The receiver applies X^parity
-    # elif role == "R":
-    #     if parity:
-    #         q.X()
 
     if is_last_node:
         send_to_next_node(CMD_ENTANGLEMENT_COMPLETED, f"{parity}")
@@ -535,7 +531,6 @@ def _schedule_shutdown() -> None:
     if _shutting_down:
         return
     _shutting_down = True
-    # TODO
     # Blunt but effective for a demo: let the in-flight STOP lap finish, then
     # exit so the main thread's join() calls unblock. A cleaner version would
     # set an asyncio.Event and break the event loop.
