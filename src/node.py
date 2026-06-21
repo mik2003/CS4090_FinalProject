@@ -2,20 +2,19 @@ import asyncio
 import threading
 import time
 
+from netqasm.sdk import EPRSocket
+from netqasm.sdk.external import NetQASMConnection
 from simulaqron.general.host_config import SocketsConfig
 from simulaqron.sdk.protocol import (
-    Callable,
     Awaitable,
+    Callable,
     SimulaQronClassicalClient,
     SimulaQronClassicalServer,
     StreamReader,
     StreamWriter,
 )
-from simulaqron.settings import network_config, simulaqron_settings
-from simulaqron.settings.network_config import Any, NodeConfigType
-
-from netqasm.sdk.external import NetQASMConnection
-from netqasm.sdk import EPRSocket
+from simulaqron.settings import network_config
+from simulaqron.settings.network_config import NodeConfigType
 
 
 class NodeConnection:
@@ -24,9 +23,9 @@ class NodeConnection:
         self.target_index = target_index
         self.epr_socket = EPRSocket(f"Node{self.target_index}")
         self.thread: None | threading.Thread = None
-        self.classical_queue: list[tuple[str, str]] = (
-            []
-        )  # List of (command, data) tuples to send to the target node
+        self.classical_queue: list[
+            tuple[str, str]
+        ] = []  # List of (command, data) tuples to send to the target node
 
     def start_classical_client(
         self,
@@ -80,9 +79,7 @@ class NetworkNode:
         self.index = index
         self.connections: dict[int, NodeConnection] = {}
         self.quantum_connection: None | NetQASMConnection = None
-        self.sockets_config = SocketsConfig(
-            network_config, "default", NodeConfigType.APP
-        )
+        self.sockets_config = SocketsConfig(network_config, "default", NodeConfigType.APP)
         self.thread: None | threading.Thread = None
 
     def start_classical_server(

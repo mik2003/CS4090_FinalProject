@@ -1,29 +1,36 @@
-import asyncio
-import os
 import sys
+import os
+import asyncio
 import threading
+import numpy as np
 from asyncio import StreamReader, StreamWriter
 from pathlib import Path
 
-import numpy as np
-from helper import parse_message
-from kd_utils import (
-    compute_min_entropy_after_leakage,
-    compute_min_entropy_bsc,
-    compute_secure_key_length,
-    compute_syndrome,
-    decode_syndrome,
-    generate_seed,
-    make_ldpc_matrix,
-    privacy_amplify_with_seed,
-)
 from netqasm.runtime.settings import set_simulator
 
 set_simulator("simulaqron")
 
-from netqasm.sdk import EPRSocket, Qubit  # noqa: E402
-from node import NetworkNode  # noqa: E402
-from simulaqron.settings import network_config, simulaqron_settings  # noqa: E402
+from netqasm.sdk import EPRSocket, Qubit
+
+from simulaqron.settings import network_config, simulaqron_settings
+from simulaqron.settings.network_config import NodeConfigType
+
+# --- Classical key-distribution utilities (same lib alice.py / bob.py use) ----
+# NOTE: adjust this path if lib/ does not sit at <project>/lib relative to here.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from lib.kd_utils import (  # noqa: E402
+    make_ldpc_matrix,
+    compute_syndrome,
+    decode_syndrome,
+    compute_min_entropy_bsc,
+    compute_min_entropy_after_leakage,
+    compute_secure_key_length,
+    generate_seed,
+    privacy_amplify_with_seed,
+)
+
+from helper import *
+from node import NetworkNode
 
 # States
 STATE_INIT = "INIT"
@@ -44,98 +51,79 @@ CMD_ANON_TRANSMIT = "ANON_TRANSMIT"
 CMD_ANON_ENTANGLEMENT = "ANON_ENTANGLEMENT"
 CMD_TRANSMIT_RESULT = "TRANSMIT_RESULT"
 CMD_ENTANGLEMENT_COMPLETED = "ENTANGLEMENT_COMPLETED"
-CMD_STOP = "STOP"
+CMD_STOP = "STOP"  # NEW: clean shutdown broadcast
 
-# To perform anonymous QKD, we start by teleporting random BB84 states
-# from the send to the receiver. Each teleportation uses:
-# - One round of anonymous entanglement
-# - Two rounds of classical communication for the corrections
-# This procedure is repeated several times. Each time, the receiver measures
-# the teleported state in a random basis.
-# When enough states have been teleported, the sender shares the bases
-# used for each state, and the receiver can discard the states teleported
-# in the wrong basis. This takes several rounds of anonymous communication.
-
-# Procedures and phases are higher order states that determine what the network
-# should do next.
-
-# Procedures
+# Procedures (what the last node dispatches after a GHZ merge)
 PROC_ANON_TRANSMIT = "ANON_TRANSMIT"
 PROC_ANON_ENTANGLEMENT = "ANON_ENTANGLEMENT"
 
+# ── Pipeline parameters (identical on every node) ────────────────────────────
+NUM_SYMBOLS = 32          # BB84 states to teleport; sifted key ~ NUM_SYMBOLS/2
+D_V, D_C = 3, 10          # LDPC degrees (same as alice/bob); need sifted >= D_C
+LDPC_SEED = 42            # must match across nodes
+P_E = 0.4                 # Eve's assumed BSC flip prob (entropy bound)
+EPSILON = 1e-3            # privacy-amplification security parameter
+KEYLEN_BITS = 16          # width for serializing integers over the bit channel
+HEADER_BITS = 2 * KEYLEN_BITS   # ec_len + pa_len
 
-# ---- Pipeline parameters --------------------------------------
-
-NUM_SYMBOLS = 32  # BB84 states to teleport; sifted key ~ NUM_SYMBOLS/2
-D_V, D_C = 3, 10  # LDPC degrees; need sifted >= D_C
-LDPC_SEED = 42  # must match across nodes
-P_E = 0.4  # Eve's assumed BSC flip prob (entropy bound)
-EPSILON = 1e-3  # privacy-amplification security parameter
-KEYLEN_BITS = 16  # width for serializing integers over the bit channel
-HEADER_BITS = 2 * KEYLEN_BITS  # ec_len + pa_len
-
-# Phases
-PHASE_BB84_DISTRIBUTION = "BB84_DISTRIBUTION"
-PHASE_RECON_SENDER_BASES = "RECON_SENDER_BASES"  # sender announces theta_i
-PHASE_RECON_RECEIVER_BASES = "RECON_RECEIVER_BASES"  # receiver announces phi_i
-PHASE_HEADER = "HEADER"  # announce ec_len, pa_len
-PHASE_EC_SYNDROME = "EC_SYNDROME"  # sender broadcasts syndrome
-PHASE_PA = "PA"  # sender broadcasts PA params
-PHASE_DONE = "DONE"
+# Phases of the protocol
+PHASE_BB84_DISTRIBUTION    = "BB84_DISTRIBUTION"      # noqa: E221
+PHASE_RECON_SENDER_BASES   = "RECON_SENDER_BASES"     # sender announces theta_i
+PHASE_RECON_RECEIVER_BASES = "RECON_RECEIVER_BASES"   # receiver announces phi_i
+PHASE_HEADER               = "HEADER"                 # announce ec_len, pa_len  # noqa: E221
+PHASE_EC_SYNDROME          = "EC_SYNDROME"            # sender broadcasts syndrome  # noqa: E221
+PHASE_PA                   = "PA"                     # sender broadcasts PA params  # noqa: E221
+PHASE_DONE                 = "DONE"                   # noqa: E221
 
 # Substeps within one BB84 symbol during distribution
-SUB_ENT = "ENT"  # anonymous entanglement + teleport
-SUB_TX_X = "TX_X"  # broadcast X-correction bit b
-SUB_TX_Z = "TX_Z"  # broadcast Z-correction bit a, then R measures
+SUB_ENT  = "ENT"     # anonymous entanglement + teleport            # noqa: E221
+SUB_TX_X = "TX_X"    # broadcast X-correction bit b
+SUB_TX_Z = "TX_Z"    # broadcast Z-correction bit a, then R measures
 
 
-# ---- Shared mutable states across the event loop -------------------
-
+# ── Shared mutable state across the event loop ───────────────────────────────
 state = STATE_INIT
-procedure = PROC_ANON_ENTANGLEMENT
+procedure = PROC_ANON_ENTANGLEMENT   # CHANGED: first round is an ENT round
 phase = PHASE_BB84_DISTRIBUTION
 
 q: Qubit | None = None
 ancilla: Qubit | None = None
-memory: Qubit | None = None  # Temporarily store the qubit waiting for corrections
+memory: Qubit | None = None   # holds the teleported half between TX rounds
 rng = np.random.default_rng()
 
-
-# ---- Protocol schedule ---------------------------------------------
-
+# ── Protocol schedule (advances in lockstep on every node) ───────────────────
 symbol_index = 0
-substep = SUB_ENT
-recon_index = 0
+substep      = SUB_ENT
+recon_index  = 0
 header_index = 0
-ec_index = 0
-pa_index = 0
-round_index = 0  # only the last node uses this as a safety counter
+ec_index     = 0
+pa_index     = 0
+round_index  = 0       # only the last node uses this as a safety counter
 
-ec_len_global = 0  # learned by ALL nodes from the HEADER broadcast
+ec_len_global = 0      # learned by ALL nodes from the HEADER broadcast
 pa_len_global = 0
 
-# -- Sender ("S") private data --
-sender_bits: list[int] = []
-sender_bases: list[int] = []
-pending_corr: tuple[int, int] | None = None  # (b = X-corr, a = Z-corr)
-recv_bases_seen: list[int] = []  # phi_i learned during receiver-basis recon
-ec_payload: list[int] = []  # syndrome bits to broadcast
-pa_payload: list[int] = []  # KEYLEN_BITS(key_len) + seed bits
-header_payload: list[int] = []  # KEYLEN_BITS(ec_len) + KEYLEN_BITS(pa_len)
+# ── Sender ("S") private data ──
+sender_bits:      list[int] = []
+sender_bases:     list[int] = []
+pending_corr:     tuple[int, int] | None = None   # (b = X-corr, a = Z-corr)
+recv_bases_seen:  list[int] = []   # phi_i learned during receiver-basis recon
+ec_payload:       list[int] = []   # syndrome bits to broadcast
+pa_payload:       list[int] = []   # KEYLEN_BITS(key_len) + seed bits
+header_payload:   list[int] = []   # KEYLEN_BITS(ec_len) + KEYLEN_BITS(pa_len)
 
-# -- Receiver ("R") private data --
-recv_bases: list[int] = []
-recv_outcomes: list[int] = []
+# ── Receiver ("R") private data ──
+recv_bases:        list[int] = []
+recv_outcomes:     list[int] = []
 sender_bases_seen: list[int] = []  # theta_i learned during sender-basis recon
-ec_collected: list[int] = []
-pa_collected: list[int] = []
+ec_collected:      list[int] = []
+pa_collected:      list[int] = []
 
-# -- Shared / outputs --
-header_collected: list[int] = []  # every node records the public header bits
-raw_key = None  # x_A on sender, x_B on receiver
+# ── Shared / outputs ──
+header_collected: list[int] = []   # every node records the public header bits
+raw_key = None                     # x_A on sender, x_B on receiver
 final_key = None
 _shutting_down = False
-
 
 # Node info
 node = NetworkNode(int(sys.argv[1]) if len(sys.argv) > 1 else 0)
@@ -145,14 +133,13 @@ role = (
 is_first_node = node.index == 0
 is_last_node = sys.argv[3].strip().upper() == "LAST" if len(sys.argv) > 3 else False
 
-# Check for valid role
 if role not in ["S", "R", "N"]:
     raise ValueError("Invalid role. Must be 'S', 'R', or 'N'.")
 
 
 def log(message: str) -> None:
     print(
-        f"Node({node.index}) [{role}] [{state}]: {message}",
+        f"Node({node.index}) [{role}] [{state}] [{phase}/{substep}]: {message}",
         flush=True,
     )
 
@@ -191,7 +178,7 @@ def current_transmitter() -> str:
     """Which role ENCODES during the current anonymous-transmission round."""
     if phase == PHASE_RECON_RECEIVER_BASES:
         return "R"
-    return "S"  # corrections, sender bases, header, syndrome, PA
+    return "S"   # corrections, sender bases, header, syndrome, PA
 
 
 def next_outgoing_bit() -> int:
@@ -212,10 +199,12 @@ def next_outgoing_bit() -> int:
     return 0
 
 
-# ---- Event handlers -----------------------------------------------
+# ---- Event handlers (network setup -- UNCHANGED) ------------------
 
 
-async def handle_new_node(writer: StreamWriter, conn_node_index: int, argument: str) -> str:
+async def handle_new_node(
+    writer: StreamWriter, conn_node_index: int, argument: str
+) -> str:
 
     if conn_node_index == node.index + 1:
         log(f"Connected to next node (Node{conn_node_index})")
@@ -229,12 +218,10 @@ async def handle_new_node(writer: StreamWriter, conn_node_index: int, argument: 
     return STATE_INIT
 
 
-async def handle_start_broadcast(writer: StreamWriter, conn_node_index: int, argument: str) -> str:
-    # Broadcast START across the network to ensure all nodes are ready
-
+async def handle_start_broadcast(
+    writer: StreamWriter, conn_node_index: int, argument: str
+) -> str:
     if is_last_node:
-        # When we receive a START command in the READY state,
-        # we can initiate the GHZ state creation
         log("Every node is now ready. Starting EPR pairs creation...")
         send_to_next_node(CMD_RECV_EPR)
     else:
@@ -255,33 +242,20 @@ async def handle_recv_epr_broadcast(
         raise ValueError("Quantum connection not initialized")
 
     if is_first_node:
-        # Start the chain
-        log("Starting EPRs creation...")
         q = next_node_socket().create_keep()[0]
         node.quantum_connection.flush()
-
-        # Do not apply any correction, we are initiating the chain
         send_to_next_node(CMD_RECV_EPR)
     elif is_last_node:
-        # Receive the EPR from the previous node, now in the standard qubit
         q = prev_node_socket().recv_keep()[0]
         node.quantum_connection.flush()
-
-        # Every node now has at least one EPR pair
-        # We now need to merge them
         log("Created all EPRs pairs. Starting merge...")
-
-        # Start the merge process
         send_to_next_node(CMD_MERGE_EPR)
     else:
-        # Unless it's the first or last node, repeat the process
-        # Receive the EPR from the prev node
         ancilla = prev_node_socket().recv_keep()[0]
         log("Received EPR pair from previous node")
         q = next_node_socket().create_keep()[0]
         log("Sent EPR pair to next node")
         node.quantum_connection.flush()
-
         send_to_next_node(CMD_RECV_EPR)
 
     return STATE_INIT_GHZ
@@ -294,23 +268,19 @@ async def handle_epr_merge_broadcast(
 
     if node.quantum_connection is None:
         raise ValueError("Quantum connection not initialized")
-
     if q is None:
         raise ValueError("Qubit not initialized")
 
     if is_first_node:
-        # Do nothing if it's the first node
         send_to_next_node(CMD_MERGE_EPR)
         return STATE_EPR_MERGED
 
-    # Retrieve the correction from previous node merge
     correction = int(argument) if argument != "" else 0
     if correction == 1:
         q.X()
 
     if is_last_node:
         log("GHZ state completed.")
-        # Start current procedure
         if procedure == PROC_ANON_ENTANGLEMENT:
             send_to_next_node(CMD_ANON_ENTANGLEMENT)
         else:
@@ -320,24 +290,22 @@ async def handle_epr_merge_broadcast(
     if ancilla is None:
         raise ValueError("Ancilla qubit not initialized")
 
-    # Apply the EPR (and GHZ) merge circuit, merging the previous
-    # GHZ state with the next EPR one
     q.cnot(ancilla)
-
     m = ancilla.measure()
     node.quantum_connection.flush()
     m = int(m)
 
-    # Send to the next node
     send_to_next_node(CMD_MERGE_EPR, f"{m}")
     return STATE_EPR_MERGED
+
+
+# ---- Anonymous primitives (REPLACED) ------------------------------
 
 
 async def handle_anon_transmit_broadcast(
     writer: StreamWriter, conn_node_index: int, argument: str
 ) -> str:
-    """GHZ-based anonymous broadcast of ONE bit from current_tranmitter()"""
-
+    # GHZ-based anonymous broadcast of ONE bit from `current_transmitter()`.
     global q
 
     if q is None:
@@ -347,24 +315,17 @@ async def handle_anon_transmit_broadcast(
 
     parity = int(argument) if argument != "" else 0
 
-    log(f"Performing anonymous transmission. Parity is {parity}")
-
     # Only the designated transmitter encodes (sender for most phases,
     # receiver while it announces its bases).
     if role == current_transmitter() and next_outgoing_bit():
         q.Z()
 
-    # Every node applies H
     q.H()
-    # Measure and update parity
     m = q.measure()
     node.quantum_connection.flush()
-    m = int(m)
-
-    parity = parity ^ m
+    parity ^= int(m)
 
     if is_last_node:
-        # Broadcast the result across the network
         send_to_next_node(CMD_TRANSMIT_RESULT, f"{parity}")
     else:
         send_to_next_node(CMD_ANON_TRANSMIT, f"{parity}")
@@ -375,12 +336,9 @@ async def handle_anon_transmit_broadcast(
 async def handle_anon_entanglement_broadcast(
     writer: StreamWriter, conn_node_index: int, argument: str
 ) -> str:
-    """
-    Establish anonymous entanglement: plain nodes measure in X and disentangle;
-    the sender masks with a random Z^b; the receiver KEEPS its qubit and applies
-    the Z correction later (in handle_entanglement_completed) on the full parity.
-    """
-
+    # Establish anonymous entanglement: plain nodes measure in X and disentangle;
+    # the sender masks with a random Z^b; the receiver KEEPS its qubit and applies
+    # the Z correction later (in handle_entanglement_completed) on the full parity.
     global q
 
     if q is None:
@@ -390,57 +348,47 @@ async def handle_anon_entanglement_broadcast(
 
     parity = int(argument) if argument != "" else 0
 
-    log(f"Performing anonymous entanglement. Parity is {parity}")
-
-    # Every standard node applies H, measures and broadcasts parity
     if role == "N":
         q.H()
         m = q.measure()
         node.quantum_connection.flush()
-        m = int(m)
-        parity = parity ^ m
-    # The sender picks a random bit, and applies Z^b, measures and broadcasts
+        parity ^= int(m)
     elif role == "S":
-        b = rng.integers(0, 2)
+        b = int(rng.integers(0, 2))   # random masking bit hides the sender
         if b:
             q.Z()
-        parity = parity ^ b
+        parity ^= b
+        # S keeps q (its Bell half) -- no measurement.
     # role == "R": keep q untouched; correction happens on the completion lap.
-    # The receiver applies X^parity
-    # elif role == "R":
-    #     if parity:
-    #         q.X()
 
     if is_last_node:
-        send_to_next_node(CMD_ENTANGLEMENT_COMPLETED)
+        send_to_next_node(CMD_ENTANGLEMENT_COMPLETED, f"{parity}")
     else:
         send_to_next_node(CMD_ANON_ENTANGLEMENT, f"{parity}")
 
     return STATE_ENTANGLEMENT_DONE
 
 
-async def handle_transmit_result(writer: StreamWriter, conn_node_index: int, argument: str):
+# ---- Result handlers (FILLED IN) ----------------------------------
+
+
+async def handle_transmit_result(
+    writer: StreamWriter, conn_node_index: int, argument: str
+) -> str:
     global memory
 
     result = int(argument)
 
-    # TODO:
-    # If receiver do something with the transmitted data
-    # This includes:
-    # - Apply corrections to the state for teleportation
-    # - Save BB84 bases
-    # - Privacy Amplification
-
-    # role action for the CURRENT round
+    # ---- role action for the CURRENT round (before advancing) ----
     if phase == PHASE_BB84_DISTRIBUTION and role == "R":
         if substep == SUB_TX_X:
             if result and memory is not None:
-                memory.X()  # X^b
+                memory.X()                  # X^b
                 node.quantum_connection.flush()
         elif substep == SUB_TX_Z and memory is not None:
             if result:
-                memory.Z()  # Z^a
-            phi = rng.integers(0, 2)  # receiver's random measurement basis
+                memory.Z()                  # Z^a
+            phi = int(rng.integers(0, 2))   # receiver's random measurement basis
             if phi:
                 memory.H()
             outcome = memory.measure()
@@ -457,7 +405,7 @@ async def handle_transmit_result(writer: StreamWriter, conn_node_index: int, arg
         recv_bases_seen.append(result)
 
     elif phase == PHASE_HEADER:
-        header_collected.append(result)  # EVERY node records (lengths public)
+        header_collected.append(result)     # EVERY node records (lengths public)
 
     elif phase == PHASE_EC_SYNDROME and role == "R":
         ec_collected.append(result)
@@ -465,6 +413,7 @@ async def handle_transmit_result(writer: StreamWriter, conn_node_index: int, arg
     elif phase == PHASE_PA and role == "R":
         pa_collected.append(result)
 
+    # ---- propagate or consume ----
     if is_last_node:
         advance_schedule()
         conductor_next()
@@ -475,43 +424,43 @@ async def handle_transmit_result(writer: StreamWriter, conn_node_index: int, arg
     return STATE_READY
 
 
-async def handle_entanglement_completed(writer: StreamWriter, conn_node_index: int, argument: str):
+async def handle_entanglement_completed(
+    writer: StreamWriter, conn_node_index: int, argument: str
+) -> str:
     global q, memory, pending_corr
 
     final_parity = int(argument) if argument != "" else 0
 
     if role == "R":
-        # If receiver save the qubit into `memory` waiting for corrections
         if final_parity:
-            q.Z()
+            q.Z()                       # FIX: Z (not X), on the COMPLETE parity
         node.quantum_connection.flush()
-        memory = q
+        memory = q                      # hold across the next two TX rounds
         q = None
-        log("Stored Bell half; awaiting teleport corrections")
+        log("Stored anonymous Bell half; awaiting teleport corrections")
 
     elif role == "S":
-        # Prepare random BB84 state |psi> and teleport it through q
-        v = int(rng.integers(0, 2))  # bit value
-        theta = int(rng.integers(0, 2))  # 0 = Z basis, 1 = X basis
-        psi = Qubit(node.quantum_connection)
+        # Prepare a random BB84 state |psi> and teleport it through `q`.
+        v = int(rng.integers(0, 2))         # bit value
+        theta = int(rng.integers(0, 2))     # 0 = Z basis, 1 = X basis
+        psi = Qubit(node.quantum_connection)    # CHECK: fresh-qubit allocation
         if v:
             psi.X()
         if theta:
             psi.H()
-        # Teleport |psi> through anonymous Bell pair
-        psi.cnot(q)
+        psi.cnot(q)        # control = data qubit, target = our Bell half
         psi.H()
-        a_f = psi.measure()
-        b_f = q.measure()
-        node.quantum_connection.flush()
-        a = int(a_f)
-        b = int(b_f)
+        a_f = psi.measure()    # Z-correction bit (data qubit after H)
+        b_f = q.measure()      # X-correction bit (our Bell half)
+        node.quantum_connection.flush()    # measure both, THEN read as ints
+        a, b = int(a_f), int(b_f)
         q = None
         sender_bits.append(v)
         sender_bases.append(theta)
-        pending_corr = (b, a)
-        log(f"Teleported BB84 (v={v}, basis={theta}); corr X:{b} X:{a}")
+        pending_corr = (b, a)               # broadcast b (X) first, then a (Z)
+        log(f"Teleported BB84 (v={v}, basis={theta}); corr X:{b} Z:{a}")
 
+    # ---- propagate or consume ----
     if is_last_node:
         advance_schedule()
         conductor_next()
@@ -522,7 +471,7 @@ async def handle_entanglement_completed(writer: StreamWriter, conn_node_index: i
     return STATE_READY
 
 
-# ---- Schedule advance (runs on EVERY node, once per round) --------
+# ---- Schedule advance (runs on EVERY node, once per round) ---------
 
 
 def advance_schedule() -> None:
@@ -594,8 +543,10 @@ def conductor_next() -> None:
         send_to_next_node(CMD_STOP)
         _schedule_shutdown()
         return
-    procedure = PROC_ANON_ENTANGLEMENT if current_round_is_entanglement() else PROC_ANON_TRANSMIT
-    send_to_next_node(CMD_RECV_EPR)  # rebuild a fresh GHZ for the next round
+    procedure = (
+        PROC_ANON_ENTANGLEMENT if current_round_is_entanglement() else PROC_ANON_TRANSMIT
+    )
+    send_to_next_node(CMD_RECV_EPR)   # rebuild a fresh GHZ for the next round
 
 
 # ---- Classical back-half (sift + LDPC reconciliation + Toeplitz PA) ----
@@ -606,7 +557,7 @@ def _kept_indices(bases_a: list[int], bases_b: list[int]) -> list[int]:
 
 
 def _truncate_to_block(bits: list[int]) -> np.ndarray:
-    n = (len(bits) // D_C) * D_C  # LDPC needs length divisible by D_C
+    n = (len(bits) // D_C) * D_C        # LDPC needs length divisible by D_C
     return np.array(bits[:n], dtype=np.uint8)
 
 
@@ -627,10 +578,8 @@ def _sift_and_prepare() -> None:
         log(f"Sender sifted {len(kept)} bits -> using n={n}")
 
         if n == 0:
-            log(
-                "WARNING: sifted key shorter than one LDPC block. "
-                "Increase NUM_SYMBOLS. Skipping EC/PA."
-            )
+            log("WARNING: sifted key shorter than one LDPC block. "
+                "Increase NUM_SYMBOLS. Skipping EC/PA.")
             ec_payload, pa_payload = [], []
             header_payload = int_to_bits(0, KEYLEN_BITS) + int_to_bits(0, KEYLEN_BITS)
             final_key = np.zeros(0, dtype=np.uint8)
@@ -650,16 +599,15 @@ def _sift_and_prepare() -> None:
             seed = generate_seed(n, key_len, rng)
             final_key = privacy_amplify_with_seed(x_A, key_len, seed)
         else:
-            log(
-                "WARNING: no secure key at this length "
-                "(raise NUM_SYMBOLS, lower P_E, or raise EPSILON)."
-            )
+            log("WARNING: no secure key at this length "
+                "(raise NUM_SYMBOLS, lower P_E, or raise EPSILON).")
             seed = np.zeros(0, dtype=np.uint8)
             final_key = np.zeros(0, dtype=np.uint8)
 
         pa_payload = int_to_bits(key_len, KEYLEN_BITS) + [int(b) for b in seed]
-        header_payload = int_to_bits(len(ec_payload), KEYLEN_BITS) + int_to_bits(
-            len(pa_payload), KEYLEN_BITS
+        header_payload = (
+            int_to_bits(len(ec_payload), KEYLEN_BITS)
+            + int_to_bits(len(pa_payload), KEYLEN_BITS)
         )
         log("final key " + np.array2string(np.asarray(final_key), max_line_width=10000))
 
@@ -684,11 +632,11 @@ def _finish_pa() -> None:
     n = len(x_B)
 
     # syndrome reconciliation (bob.py handle_syndrome)
-    s_alice = np.array(ec_collected[: n_syndrome_len(n)], dtype=np.uint8)
+    s_alice = np.array(ec_collected[:n_syndrome_len(n)], dtype=np.uint8)
     H = make_ldpc_matrix(n, D_V, D_C, LDPC_SEED)
     s_bob = compute_syndrome(H, x_B)
     s_err = np.logical_xor(s_alice, s_bob).astype(np.uint8)
-    err = decode_syndrome(H, s_err, P_E)  # CHECK: BP error-rate argument
+    err = decode_syndrome(H, s_err, P_E)        # CHECK: BP error-rate argument
     x_A_hat = np.logical_xor(x_B, err).astype(np.uint8)
     log(f"Receiver corrected {int(np.sum(x_B != x_A_hat))} bits")
 
@@ -710,27 +658,26 @@ def _schedule_shutdown() -> None:
     if _shutting_down:
         return
     _shutting_down = True
-    # TODO
     # Blunt but effective for a demo: let the in-flight STOP lap finish, then
     # exit so the main thread's join() calls unblock. A cleaner version would
     # set an asyncio.Event and break the event loop.
     threading.Timer(1.5, lambda: os._exit(0)).start()
 
 
-async def handle_stop(writer: StreamWriter, conn_node_index: int, argument: str) -> str:
+async def handle_stop(
+    writer: StreamWriter, conn_node_index: int, argument: str
+) -> str:
     log("Received STOP -- shutting down")
     if role in ("S", "R") and final_key is not None:
-        log(
-            f"FINAL KEY ({len(final_key)} bits): "
-            + np.array2string(np.asarray(final_key), max_line_width=10000)
-        )
+        log(f"FINAL KEY ({len(final_key)} bits): "
+            + np.array2string(np.asarray(final_key), max_line_width=10000))
     if not is_last_node:
         send_to_next_node(CMD_STOP)
     _schedule_shutdown()
     return STATE_READY
 
 
-# ---- Communication ------------------------------------------------
+# ---- Communication (UNCHANGED) ------------------------------------
 
 
 def prev_node():
@@ -769,15 +716,15 @@ def next_node_socket() -> EPRSocket:
 
 
 EVENT_HANDLERS = {
-    (STATE_INIT, CMD_NEW_NODE): handle_new_node,  # Connect to new node
-    (STATE_INIT, CMD_START): handle_start_broadcast,  # Complete networks for all nodes
-    (STATE_READY, CMD_RECV_EPR): handle_recv_epr_broadcast,  # Distribute EPRs
-    (STATE_INIT_GHZ, CMD_MERGE_EPR): handle_epr_merge_broadcast,  # Merge EPRs
+    (STATE_INIT, CMD_NEW_NODE): handle_new_node,
+    (STATE_INIT, CMD_START): handle_start_broadcast,
+    (STATE_READY, CMD_RECV_EPR): handle_recv_epr_broadcast,
+    (STATE_INIT_GHZ, CMD_MERGE_EPR): handle_epr_merge_broadcast,
     (STATE_EPR_MERGED, CMD_ANON_TRANSMIT): handle_anon_transmit_broadcast,
     (STATE_EPR_MERGED, CMD_ANON_ENTANGLEMENT): handle_anon_entanglement_broadcast,
     (STATE_TRANSMIT_DONE, CMD_TRANSMIT_RESULT): handle_transmit_result,
     (STATE_ENTANGLEMENT_DONE, CMD_ENTANGLEMENT_COMPLETED): handle_entanglement_completed,
-    (STATE_READY, CMD_STOP): handle_stop,
+    (STATE_READY, CMD_STOP): handle_stop,   # NEW
 }
 
 
@@ -789,11 +736,8 @@ async def event_loop(reader: StreamReader, writer: StreamWriter) -> None:
 
     while True:
         data = await reader.readline()
-
-        if not data:  # EOF: peer closed the connection
-            log("Connection closed by peer")
+        if not data:               # EOF: peer closed the connection
             return
-
         msg = data.decode()
 
         log(f"Received message: '{msg.strip()}'")
@@ -811,16 +755,12 @@ async def event_loop(reader: StreamReader, writer: StreamWriter) -> None:
             log(f"no transition for '{matching}' - ignoring")
             return
 
-        state = await handler(
-            writer,
-            conn_node_index,
-            argument,
-        )
+        state = await handler(writer, conn_node_index, argument)
 
         log(f"Transitioning to state {state}")
 
 
-# ---- Main ---------------------------------------------------------
+# ---- Main (UNCHANGED) ---------------------------------------------
 
 if __name__ == "__main__":
     _here = Path(__file__).parent
@@ -832,26 +772,18 @@ if __name__ == "__main__":
     if node.index > 0:
         log(f"Connecting to previous node (Node{node.index - 1})...")
         node.connect_to_node(node.index - 1, event_loop)
-
-        # Wait for a moment to ensure the node is connected
         asyncio.run(asyncio.sleep(1))
-
         send_to_prev_node(CMD_NEW_NODE)
+
     if is_last_node:
         log("Connecting to next node (Node0) to complete the ring...")
         node.connect_to_node(0, event_loop)
         node.complete_network()
-
-        # Wait for a moment to ensure the node is connected
         asyncio.run(asyncio.sleep(1))
-
         send_to_next_node(CMD_NEW_NODE)
         send_to_next_node(CMD_START)
-
         log("Completed network setup. This is the last node.")
 
-    # Wait for all threads to finish (this will block the main thread)
-    # Keep main thread alive until all threads complete
     if node.thread:
         node.thread.join()
     for conn in node.connections.values():
