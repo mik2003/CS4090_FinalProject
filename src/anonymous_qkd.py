@@ -7,16 +7,6 @@ from pathlib import Path
 
 import numpy as np
 from helper import parse_message
-from kd_utils import (
-    compute_min_entropy_after_leakage,
-    compute_min_entropy_bsc,
-    compute_secure_key_length,
-    compute_syndrome,
-    decode_syndrome,
-    generate_seed,
-    make_ldpc_matrix,
-    privacy_amplify_with_seed,
-)
 from netqasm.runtime.settings import set_simulator
 
 set_simulator("simulaqron")
@@ -66,7 +56,7 @@ PROC_ANON_ENTANGLEMENT = "ANON_ENTANGLEMENT"
 
 # ---- Pipeline parameters --------------------------------------
 
-NUM_SYMBOLS = 32  # BB84 states to teleport; sifted key ~ NUM_SYMBOLS/2
+NUM_SYMBOLS = 16  # BB84 states to teleport; sifted key ~ NUM_SYMBOLS/2
 D_V, D_C = 3, 10  # LDPC degrees; need sifted >= D_C
 LDPC_SEED = 42  # must match across nodes
 P_E = 0.4  # Eve's assumed BSC flip prob (entropy bound)
@@ -78,9 +68,6 @@ HEADER_BITS = 2 * KEYLEN_BITS  # ec_len + pa_len
 PHASE_BB84_DISTRIBUTION = "BB84_DISTRIBUTION"
 PHASE_RECON_SENDER_BASES = "RECON_SENDER_BASES"  # sender announces theta_i
 PHASE_RECON_RECEIVER_BASES = "RECON_RECEIVER_BASES"  # receiver announces phi_i
-PHASE_HEADER = "HEADER"  # announce ec_len, pa_len
-PHASE_EC_SYNDROME = "EC_SYNDROME"  # sender broadcasts syndrome
-PHASE_PA = "PA"  # sender broadcasts PA params
 PHASE_DONE = "DONE"
 
 # Substeps within one BB84 symbol during distribution
@@ -106,7 +93,6 @@ rng = np.random.default_rng()
 symbol_index = 0
 substep = SUB_ENT
 recon_index = 0
-header_index = 0
 ec_index = 0
 pa_index = 0
 round_index = 0  # only the last node uses this as a safety counter
@@ -164,12 +150,6 @@ def log(message: str) -> None:
             ctx.append(f"[{phase} sym={symbol_index}/{NUM_SYMBOLS} {substep}]")
         elif phase in (PHASE_RECON_SENDER_BASES, PHASE_RECON_RECEIVER_BASES):
             ctx.append(f"[{phase} {recon_index}/{NUM_SYMBOLS}]")
-        elif phase == PHASE_HEADER:
-            ctx.append(f"[{phase} {header_index}/{HEADER_BITS}]")
-        elif phase == PHASE_EC_SYNDROME:
-            ctx.append(f"[{phase} {ec_index}/{ec_len_global}]")
-        elif phase == PHASE_PA:
-            ctx.append(f"[{phase} {pa_index}/{pa_len_global}]")
         else:  # PHASE_DONE
             ctx.append(f"[{phase}]")
 
@@ -222,12 +202,6 @@ def next_outgoing_bit() -> int:
         return sender_bases[recon_index]
     if phase == PHASE_RECON_RECEIVER_BASES:
         return recv_bases[recon_index]
-    if phase == PHASE_HEADER:
-        return header_payload[header_index]
-    if phase == PHASE_EC_SYNDROME:
-        return ec_payload[ec_index]
-    if phase == PHASE_PA:
-        return pa_payload[pa_index]
     return 0
 
 
@@ -475,15 +449,6 @@ async def handle_transmit_result(writer: StreamWriter, conn_node_index: int, arg
     elif phase == PHASE_RECON_RECEIVER_BASES and role == "S":
         recv_bases_seen.append(result)
 
-    elif phase == PHASE_HEADER:
-        header_collected.append(result)  # EVERY node records (lengths public)
-
-    elif phase == PHASE_EC_SYNDROME and role == "R":
-        ec_collected.append(result)
-
-    elif phase == PHASE_PA and role == "R":
-        pa_collected.append(result)
-
     if is_last_node:
         advance_schedule()
         conductor_next()
@@ -570,36 +535,7 @@ def advance_schedule() -> None:
     elif phase == PHASE_RECON_RECEIVER_BASES:
         recon_index += 1
         if recon_index >= NUM_SYMBOLS:
-            _sift_and_prepare()
-            phase = PHASE_HEADER
-            header_index = 0
-
-    elif phase == PHASE_HEADER:
-        header_index += 1
-        if header_index >= HEADER_BITS:
-            ec_len_global = bits_to_int(header_collected[0:KEYLEN_BITS])
-            pa_len_global = bits_to_int(header_collected[KEYLEN_BITS:HEADER_BITS])
-            if ec_len_global > 0:
-                phase, ec_index = PHASE_EC_SYNDROME, 0
-            elif pa_len_global > 0:
-                phase, pa_index = PHASE_PA, 0
-            else:
-                _finish_pa()
-                phase = PHASE_DONE
-
-    elif phase == PHASE_EC_SYNDROME:
-        ec_index += 1
-        if ec_index >= ec_len_global:
-            if pa_len_global > 0:
-                phase, pa_index = PHASE_PA, 0
-            else:
-                _finish_pa()
-                phase = PHASE_DONE
-
-    elif phase == PHASE_PA:
-        pa_index += 1
-        if pa_index >= pa_len_global:
-            _finish_pa()
+            _sift_only()
             phase = PHASE_DONE
 
 
@@ -633,92 +569,23 @@ def n_syndrome_len(n: int) -> int:
     return D_V * (n // D_C)
 
 
-def _sift_and_prepare() -> None:
-    """Runs once on every node at the end of receiver-basis reconciliation.
-    Sender builds the syndrome / PA / header payloads; receiver builds x_B."""
-    global raw_key, ec_payload, pa_payload, header_payload, final_key
+def _sift_only() -> None:
+    """Sift to matching bases. Noiseless sim => x_A == x_B, so the sifted
+    string is the shared key directly."""
+    global raw_key, final_key
 
     if role == "S":
         kept = _kept_indices(sender_bases, recv_bases_seen)
-        x_A = _truncate_to_block([sender_bits[i] for i in kept])
-        raw_key = x_A
-        n = len(x_A)
-        log(f"Sender sifted {len(kept)} bits -> using n={n}")
-
-        if n == 0:
-            log(
-                "WARNING: sifted key shorter than one LDPC block. "
-                "Increase NUM_SYMBOLS. Skipping EC/PA."
-            )
-            ec_payload, pa_payload = [], []
-            header_payload = int_to_bits(0, KEYLEN_BITS) + int_to_bits(0, KEYLEN_BITS)
-            final_key = np.zeros(0, dtype=np.uint8)
-            return
-
-        H = make_ldpc_matrix(n, D_V, D_C, LDPC_SEED)
-        syndrome = compute_syndrome(H, x_A)
-        ec_payload = [int(b) for b in syndrome]
-
-        h_min = compute_min_entropy_bsc(n, 1 - P_E)
-        leaked = n_syndrome_len(n)
-        h_after = compute_min_entropy_after_leakage(h_min, leaked)
-        key_len = max(0, int(compute_secure_key_length(h_after, EPSILON)))
-        log(f"Sender H_min={h_min:.2f}, after leak={h_after:.2f}, key_len={key_len}")
-
-        if key_len > 0:
-            seed = generate_seed(n, key_len, rng)
-            final_key = privacy_amplify_with_seed(x_A, key_len, seed)
-        else:
-            log(
-                "WARNING: no secure key at this length "
-                "(raise NUM_SYMBOLS, lower P_E, or raise EPSILON)."
-            )
-            seed = np.zeros(0, dtype=np.uint8)
-            final_key = np.zeros(0, dtype=np.uint8)
-
-        pa_payload = int_to_bits(key_len, KEYLEN_BITS) + [int(b) for b in seed]
-        header_payload = int_to_bits(len(ec_payload), KEYLEN_BITS) + int_to_bits(
-            len(pa_payload), KEYLEN_BITS
-        )
-        log("final key " + np.array2string(np.asarray(final_key), max_line_width=10000))
-
+        key = np.array([sender_bits[i] for i in kept], dtype=np.uint8)
     elif role == "R":
         kept = _kept_indices(sender_bases_seen, recv_bases)
-        x_B = _truncate_to_block([recv_outcomes[i] for i in kept])
-        raw_key = x_B
-        log(f"Receiver sifted {len(kept)} bits -> using n={len(x_B)}")
-
-
-def _finish_pa() -> None:
-    """Runs once at the end of the PA phase. Receiver decodes + amplifies."""
-    global final_key
-
-    if role != "R":
-        return
-    if raw_key is None or len(raw_key) == 0 or not pa_collected:
-        final_key = np.zeros(0, dtype=np.uint8)
-        return
-
-    x_B = np.asarray(raw_key, dtype=np.uint8)
-    n = len(x_B)
-
-    # syndrome reconciliation (bob.py handle_syndrome)
-    s_alice = np.array(ec_collected[: n_syndrome_len(n)], dtype=np.uint8)
-    H = make_ldpc_matrix(n, D_V, D_C, LDPC_SEED)
-    s_bob = compute_syndrome(H, x_B)
-    s_err = np.logical_xor(s_alice, s_bob).astype(np.uint8)
-    err = decode_syndrome(H, s_err, P_E)  # CHECK: BP error-rate argument
-    x_A_hat = np.logical_xor(x_B, err).astype(np.uint8)
-    log(f"Receiver corrected {int(np.sum(x_B != x_A_hat))} bits")
-
-    # privacy amplification (bob.py handle_pa)
-    key_len = bits_to_int(pa_collected[:KEYLEN_BITS])
-    seed = np.array(pa_collected[KEYLEN_BITS:], dtype=np.uint8)
-    if key_len > 0:
-        final_key = privacy_amplify_with_seed(x_A_hat, key_len, seed)
+        key = np.array([recv_outcomes[i] for i in kept], dtype=np.uint8)
     else:
-        final_key = np.zeros(0, dtype=np.uint8)
-    log("final key " + np.array2string(np.asarray(final_key), max_line_width=10000))
+        return
+
+    raw_key = final_key = key
+    log(f"sifted {len(kept)}/{NUM_SYMBOLS} -> key of {len(key)} bits")
+    log("final key " + np.array2string(key, max_line_width=10000))
 
 
 # ---- STOP / shutdown ----------------------------------------------
