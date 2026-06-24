@@ -470,7 +470,7 @@ def advance_schedule() -> None:
         if substep == SUB_ENT:
             substep = SUB_TX_X
         elif substep == SUB_TX_X:
-            substep = SUB_TX_Z
+            substep = SUB_TX_Z  
         else:  # finished one symbol
             symbol_index += 1
             if symbol_index < NUM_SYMBOLS:
